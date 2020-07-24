@@ -752,6 +752,7 @@ public class ForkJoinPool extends AbstractExecutorService {
     static final int SMASK        = 0xffff;        // short bits == max index
     static final int MAX_CAP      = 0x7fff;        // max #workers - 1
     static final int EVENMASK     = 0xfffe;        // even short bits
+    //126
     static final int SQMASK       = 0x007e;        // max 64 (even) slots
 
     // Masks and units for WorkQueue.scanState and ctl sp subfield
@@ -774,6 +775,7 @@ public class ForkJoinPool extends AbstractExecutorService {
      * arrays sharing cache lines. The @Contended annotation alerts
      * JVMs to try to keep instances apart.
      */
+    //工作队列
     @sun.misc.Contended
     static final class WorkQueue {
 
@@ -786,6 +788,7 @@ public class ForkJoinPool extends AbstractExecutorService {
          * share GC bookkeeping (especially cardmarks) such that
          * per-write accesses encounter serious memory contention.
          */
+        //任务队列最小长度
         static final int INITIAL_QUEUE_CAPACITY = 1 << 13;
 
         /**
@@ -795,6 +798,7 @@ public class ForkJoinPool extends AbstractExecutorService {
          * value a bit less than this to help users trap runaway
          * programs before saturating systems.
          */
+        //任务队列最大长度
         static final int MAXIMUM_QUEUE_CAPACITY = 1 << 26; // 64M
 
         // Instance fields
@@ -803,6 +807,7 @@ public class ForkJoinPool extends AbstractExecutorService {
         int nsteals;               // number of steals
         int hint;                  // randomization and stealer index hint
         int config;                // pool index and mode
+        //工作队列锁的状态，1为锁定，<0为终止，其他状态为0
         volatile int qlock;        // 1: locked, < 0: terminate; else 0
         volatile int base;         // index of next slot for poll
         int top;                   // index of next slot for push
@@ -1218,6 +1223,7 @@ public class ForkJoinPool extends AbstractExecutorService {
 
         // Unsafe mechanics. Note that some are (and must be) the same as in FJP
         private static final sun.misc.Unsafe U;
+        //数组第一个元素地址相对于数组起始地址的偏移值
         private static final int  ABASE;
         private static final int  ASHIFT;
         private static final long QTOP;
@@ -1234,10 +1240,30 @@ public class ForkJoinPool extends AbstractExecutorService {
                     (wk.getDeclaredField("qlock"));
                 QCURRENTSTEAL = U.objectFieldOffset
                     (wk.getDeclaredField("currentSteal"));
+                    //https://segmentfault.com/a/1190000019635250
+                    //ABASE ForkJoinTask数组的首地址
                 ABASE = U.arrayBaseOffset(ak);
+                //scale代表数组元素的索引大小.它必须是2的平方.
+                //获取数组的转换因子，也就是数组中元素的增量地址(可以理解为数组中每个元素的内存长度)。将arrayBaseOffset与arrayIndexScale配合使用，可以定位数组中每个元素在内存中的位置
+                /**
+                 * 比如下面的示例，可以获得a[4]元素
+                *int []a = new int[]{1,2,3,4,5};
+                *Unsafe unsafe = getUnsafe();
+                long base = unsafe.arrayBaseOffset(a.getClass());
+                int scale = unsafe.arrayIndexScale(a.getClass());
+                int index = 4;
+                System.out.println("bae:"+base + " scale:"+scale + "  num:" + unsafe.getInt(a,base + scale*index));
+                 */
                 int scale = U.arrayIndexScale(ak);
                 if ((scale & (scale - 1)) != 0)
                     throw new Error("data type scale not a power of two");
+                    /**
+                     * 计算ASHIFT,它是31与scale的高位0位数量的差值.因为上一步约定了scale一定是一个正的2的几次方,
+                    *  ASHIFT的结果一定会大于1.可以理解ASHIFT是数组索引大小的有效位数.
+                    * 如果计算数组第i个槽位所在的地址，计算方式为 ABASE + scale*i,因为scale为2^n,为了提升效率使用了移位处理
+                    * 比如如果 scale=4=2^2,n=2 i=3 3*2=6
+                    * 3=00000011 3<<2=00000011<<2 = 00001100=6
+                    */
                 ASHIFT = 31 - Integer.numberOfLeadingZeros(scale);
             } catch (Exception e) {
                 throw new Error(e);
@@ -1384,11 +1410,20 @@ public class ForkJoinPool extends AbstractExecutorService {
     private static final int  SHUTDOWN   = 1 << 31;
 
     // Instance fields
+    /**
+     * 0000000000000000    0000000000000000    0 000000000000000    0000000000000000
+        活动线程数			线程总量		 第一位为工作队列的状态   标识idle worker的
+									        后面的15位为版本号，    WorkQueue在WorkQueue[]数组中的index
+									        防止ABA
+     */
     volatile long ctl;                   // main pool control
     volatile int runState;               // lockable status
+    //并行度和模式
     final int config;                    // parallelism, mode
     int indexSeed;                       // to generate worker index
+    //工作队列集合
     volatile WorkQueue[] workQueues;     // main registry
+    //线程工厂
     final ForkJoinWorkerThreadFactory factory;
     final UncaughtExceptionHandler ueh;  // per-worker UEH
     final String workerNamePrefix;       // to create worker name string
@@ -2393,20 +2428,37 @@ public class ForkJoinPool extends AbstractExecutorService {
      *
      * @param task the task. Caller must ensure non-null.
      */
+    //将任务添加到工作队列中
     final void externalPush(ForkJoinTask<?> task) {
         WorkQueue[] ws; WorkQueue q; int m;
+        //获得线程的探针，一个线程的probe探针值，是一个非零hash值，它不会和其他线程重复
         int r = ThreadLocalRandom.getProbe();
         int rs = runState;
+        /**
+         * ws 为2的次幂m为1111*1，SQMASK=126=1111110
+         * m & r & SQMASK，m & r 是随机取一个 0 - m 的数，再与 SQMASK 求与获得一个将二进制最低位设为 0，得到一个偶数。
+         * 外部任务提交的时候，会取 workQueues 上偶数下标的 WorkQueue，然后将任务加到队列内。
+         * 
+         * 因为 array 被初始化的容量为 1 << n（n 是写死的 13，每次扩容的时候再左移一位），1 << n 再减去 1 的二进制表示全为 1。所以 array.length - 1 的二进制表示全为 1，
+         * 那么他和 base 或者 top 执行逻辑与，在 base 或者 top 小于等于 array.length - 1 时得到的结果就是 base 或 top 本身。当 base 或者 top 大于 array.length - 1 时，从新从最小的数组下标开始（即从 0 开始）。
+            随着 base 和 top 的增大，( array.length - 1 ) & ( base 或 top 的值 ) 这个变量计算的结果永远不会超出数组的下标范围，并且可以循环利用数组元素。
+         */
         if ((ws = workQueues) != null && (m = (ws.length - 1)) >= 0 &&
             (q = ws[m & r & SQMASK]) != null && r != 0 && rs > 0 &&
             U.compareAndSwapInt(q, QLOCK, 0, 1)) {
-            ForkJoinTask<?>[] a; int am, n, s;
+            ForkJoinTask<?>[] a; 
+            /**
+             * am: 任务队列数组的长度
+             * n: 在任务队列中的任务数
+             */
+            int am, n, s;
             if ((a = q.array) != null &&
                 (am = a.length - 1) > (n = (s = q.top) - q.base)) {
                 int j = ((am & s) << ASHIFT) + ABASE;
                 U.putOrderedObject(a, j, task);
                 U.putOrderedInt(q, QTOP, s + 1);
                 U.putOrderedInt(q, QLOCK, 0);
+                //当队列内任务数为 0个 或者 1个 或者 2个时，去执行 signalWork。
                 if (n <= 1)
                     signalWork(ws, q);
                 return;
@@ -3376,6 +3428,7 @@ public class ForkJoinPool extends AbstractExecutorService {
             QCURRENTJOIN = U.objectFieldOffset
                 (wk.getDeclaredField("currentJoin"));
             Class<?> ak = ForkJoinTask[].class;
+            //返回数组第一个元素地址相对于数组起始地址的偏移值
             ABASE = U.arrayBaseOffset(ak);
             int scale = U.arrayIndexScale(ak);
             if ((scale & (scale - 1)) != 0)
